@@ -2,53 +2,99 @@
 
 CLI-first time tracking for macOS. Runs a background daemon that captures activity and automatically logs time to projects based on rules.
 
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cs-jason/time-tracker/main/install-remote.sh | bash
+```
+
+Or clone and install locally:
+
+```bash
+git clone https://github.com/cs-jason/time-tracker.git
+cd time-tracker
+./install.sh
+```
+
 ## Requirements
 
 - macOS 11+ (Big Sur or later)
 - Python 3.10+
 - PyObjC (`pip3 install pyobjc`)
-- Accessibility permission (for window titles)
-- Automation permission (for browser URLs)
-- Screen Recording permission (may be required for some browsers)
 
 ## Quick Start
 
 ```bash
-# Run the CLI from the repo root
-./tt projects add "My Project"
-./tt rules add 1 app_contains "Code"
+# Install and start tracking
+tt start --install
 
-# Start daemon (foreground)
-./tt daemon start --foreground
+# Add a project and rule
+tt projects add "My Project"
+tt rules add 1 app_contains "Code"
+
+# Check status
+tt status
+tt today
 ```
 
-## Common Commands
+## Commands
+
+```
+tt start        Start tracking (daemon + monitoring)
+tt stop         Stop tracking
+tt status       Show current activity and tracking status
+tt today        Show today's tracked time
+tt stats        Show statistics (day/week/month/year)
+tt activity     Show raw activity samples
+tt projects     Manage projects
+tt rules        Manage auto-tracking rules
+tt config       View or set configuration
+tt export       Export data to CSV/JSON
+tt db           Database maintenance (backup/prune)
+```
+
+## Example Usage
 
 ```bash
-./tt status
-./tt today
-./tt stats --period week
+# View weekly stats with visual breakdown
+tt stats --period week
 
-./tt projects list
-./tt rules list
+# Add projects and rules
+tt projects add "Client Work" --color "#3b82f6"
+tt rules add 1 app_exact "Figma"
+tt rules add 1 path_contains "/projects/client"
 
-./tt tracking pause
-./tt tracking resume
+# Export data
+tt export --format json --output ~/Desktop/time-data.json
 
-./tt daemon status
-./tt daemon stop
+# Database maintenance
+tt db backup
+tt db prune
 ```
 
 ## Permissions
 
-- Accessibility: required to read window titles and document paths.
-- Automation: required to run AppleScript for browser URLs.
-- Screen Recording: some browsers require this to expose URLs.
+When you first run `tt start`, macOS will prompt for:
+
+- **Accessibility**: Required to read window titles and document paths
+- **Automation**: Required for browser URL detection
+- **Screen Recording**: Some browsers require this to expose URLs
 
 If permissions are missing, the daemon keeps running with reduced data collection.
 
-## Notes
+## Data Storage
 
-- All timestamps are stored in UTC (ISO 8601 with `Z` suffix).
-- Database lives at `~/.tt/tt.db` with restricted permissions (600).
-- Raw activity samples are retained per `retention_days` setting.
+- Database: `~/.tt/tt.db` (permissions: 600)
+- Backups: `~/.tt/backups/`
+- Logs: `~/.tt/tt.log`
+- All timestamps stored in UTC (ISO 8601)
+
+## Uninstall
+
+```bash
+tt stop
+rm -rf ~/.tt
+rm ~/.local/bin/tt
+# Or if installed to /usr/local/bin:
+sudo rm /usr/local/bin/tt
+```

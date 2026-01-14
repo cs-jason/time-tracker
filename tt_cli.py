@@ -30,7 +30,14 @@ from tt_db import (
     parse_utc_timestamp,
 )
 from tt_maintenance import backup_database, prune_data
-from tt_output import print_table
+from tt_output import (
+    format_hours,
+    format_percentage,
+    progress_bar,
+    print_table,
+    LINE_SINGLE,
+    LINE_DOUBLE,
+)
 from tt_rules import RULE_TYPES, RuleEngine
 from tt_utils import (
     format_local_timestamp,
@@ -370,7 +377,7 @@ def today_show() -> None:
     today = date.today()
     start_utc, end_utc = local_day_bounds(today)
     title = today.strftime("%A, %B %-d, %Y")
-    _stats_for_range(start_utc, end_utc, title_prefix=f"Today: {title}")
+    _stats_for_range(start_utc, end_utc, title_prefix=f"Today: {title}", show_by_day=False)
 
 
 def stats_show(period: Optional[str], from_date: Optional[str], to_date: Optional[str]) -> None:
@@ -391,7 +398,8 @@ def stats_show(period: Optional[str], from_date: Optional[str], to_date: Optiona
         elif period == "week":
             start_date, end_date = _week_range(today, config.week_start)
             start_utc, end_utc = local_day_bounds(start_date)[0], local_day_bounds(end_date)[1]
-            title = f"{start_date.strftime('%B %-d')} - {end_date.strftime('%B %-d, %Y')}"
+            week_days = "(Mon-Sun)" if config.week_start.lower() == "monday" else "(Sun-Sat)"
+            title = f"Week of {start_date.strftime('%B %-d')} - {end_date.strftime('%B %-d, %Y')} {week_days}"
         elif period == "month":
             start_date = today.replace(day=1)
             next_month = (start_date.replace(day=28) + timedelta(days=4)).replace(day=1)
@@ -418,39 +426,72 @@ def _week_range(today: date, week_start: str) -> Tuple[date, date]:
     return start, end
 
 
-def _stats_for_range(start_utc: datetime, end_utc: datetime, title_prefix: str) -> None:
+def _stats_for_range(start_utc: datetime, end_utc: datetime, title_prefix: str, show_by_day: bool = True) -> None:
     sessions = _fetch_sessions(start_utc, end_utc)
     projects = _aggregate_sessions(sessions, start_utc, end_utc)
     totals = sum(p["duration"] for p in projects.values())
-    total_sessions = sum(p["count"] for p in projects.values())
 
     config = load_config(DB_PATH)
     active_seconds, idle_seconds = _activity_totals(start_utc, end_utc, config.poll_interval)
     untracked = max(0, active_seconds - totals)
 
+    # Header
     print(f"{title_prefix}")
-    print("────────────────────────────────────────────────────")
+    print(LINE_DOUBLE)
+
+    # By Project section
+    print("\nBy Project")
+    print(LINE_SINGLE)
 
     if not projects:
         print("No tracked sessions in this period.")
     else:
-        print_table(
-            ["Project", "Time", "Sessions"],
-            [
-                [
-                    data["name"],
-                    human_duration(data["duration"]),
-                    str(data["count"]),
-                ]
-                for data in projects.values()
-            ],
-        )
+        # Sort by duration descending
+        sorted_projects = sorted(projects.values(), key=lambda x: x["duration"], reverse=True)
+        max_duration = max(p["duration"] for p in sorted_projects) if sorted_projects else 1
 
-    print("────────────────────────────────────────────────────")
-    print(f"Total Tracked              {human_duration(totals)}    {total_sessions}")
-    print(f"Total Active               {human_duration(active_seconds)}")
-    print(f"Untracked                  {human_duration(untracked)}")
-    print(f"Idle                       {human_duration(idle_seconds)}")
+        for data in sorted_projects:
+            name = data["name"][:24].ljust(24)
+            hours = format_hours(data["duration"]).rjust(6)
+            pct = format_percentage(data["duration"], active_seconds).rjust(5)
+            bar = progress_bar(data["duration"], max_duration, 12)
+            print(f"{name} {hours} {pct}  {bar}")
+
+        # Untracked row
+        if untracked > 0:
+            name = "(Untracked)".ljust(24)
+            hours = format_hours(untracked).rjust(6)
+            pct = format_percentage(untracked, active_seconds).rjust(5)
+            bar = progress_bar(untracked, max_duration, 12)
+            print(f"{name} {hours} {pct}  {bar}")
+
+    print(LINE_SINGLE)
+    print(f"Total Active              {format_hours(active_seconds).rjust(6)}")
+    print(f"(Idle)                    {format_hours(idle_seconds).rjust(6)}")
+
+    # By Day section
+    by_day = _activity_by_day(start_utc, end_utc, config.poll_interval)
+    if show_by_day and any(by_day.values()):
+        print(f"\nBy Day")
+        print(LINE_SINGLE)
+        day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        max_day = max(by_day.values()) if by_day else 1
+        for i, name in enumerate(day_names):
+            seconds = by_day[i]
+            bar = progress_bar(seconds, max_day, 24)
+            hours = format_hours(seconds).rjust(6)
+            print(f"{name}  {bar} {hours}")
+
+    # Top Apps section
+    by_app = _activity_by_app(start_utc, end_utc, config.poll_interval, limit=5)
+    if by_app:
+        print(f"\nTop Apps")
+        print(LINE_SINGLE)
+        for app_name, seconds in by_app:
+            name = app_name[:24].ljust(24)
+            hours = format_hours(seconds).rjust(6)
+            pct = format_percentage(seconds, active_seconds).rjust(5)
+            print(f"{name} {hours} {pct}")
 
 
 def activity_show(limit: int, date_str: Optional[str], from_date: Optional[str], to_date: Optional[str]) -> None:
@@ -550,34 +591,36 @@ def export_data(
     print(f"✓ Exported {len(records)} records to {output}")
 
 
-def tracking_pause() -> None:
-    set_setting("tracking_paused", "1", DB_PATH)
-    set_setting("tracking_paused_at", format_utc_timestamp(datetime.now(timezone.utc)), DB_PATH)
-    _daemon_request("PAUSE")
-    print("✓ Tracking paused")
+def show_help() -> None:
+    """Show custom help with clean formatting."""
+    print("tt - Time Tracker CLI\n")
+    commands = [
+        ("start", "Start tracking (daemon + monitoring)"),
+        ("stop", "Stop tracking"),
+        ("status", "Show current activity and tracking status"),
+        ("today", "Show today's tracked time"),
+        ("stats", "Show statistics (day/week/month/year)"),
+        ("activity", "Show raw activity samples"),
+        ("projects", "Manage projects"),
+        ("rules", "Manage auto-tracking rules"),
+        ("config", "View or set configuration"),
+        ("export", "Export data to CSV/JSON"),
+        ("db", "Database maintenance (backup/prune)"),
+    ]
+    for cmd, desc in commands:
+        print(f"  tt {cmd.ljust(12)} {desc}")
+    print("\nRun 'tt <command> --help' for more info on a command.")
 
 
-def tracking_resume() -> None:
-    set_setting("tracking_paused", "0", DB_PATH)
-    set_setting("tracking_paused_at", None, DB_PATH)
-    _daemon_request("RESUME")
-    print("✓ Tracking resumed")
+def start_tracking(install: bool) -> None:
+    """Start the daemon and begin tracking."""
+    if install:
+        daemon_install()
 
-
-def tracking_status() -> None:
-    config = load_config(DB_PATH)
-    if config.tracking_paused:
-        print("Tracking is paused")
-        if config.tracking_paused_at:
-            print(f"Paused at: {config.tracking_paused_at}")
-    else:
-        print("Tracking is active")
-
-
-def daemon_start(foreground: bool) -> None:
     if _daemon_running():
-        print("Daemon already running")
+        print("Already running")
         return
+
     ok, reason = frameworks_available()
     if not ok:
         message = (
@@ -588,12 +631,6 @@ def daemon_start(foreground: bool) -> None:
             message = f"{message} ({reason})"
         raise CliError(message)
 
-    if foreground:
-        from tt_daemon import main as daemon_main
-
-        daemon_main(foreground=True)
-        return
-
     daemon_path = Path(__file__).with_name("tt_daemon.py")
     subprocess.Popen(
         [sys.executable, str(daemon_path), "--foreground"],
@@ -601,38 +638,21 @@ def daemon_start(foreground: bool) -> None:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    print("✓ Daemon started")
+    print("✓ Started")
 
 
-def daemon_stop() -> None:
+def stop_tracking() -> None:
+    """Stop the daemon."""
     if not PID_PATH.exists():
-        print("Daemon not running")
+        print("Not running")
         return
     pid = int(PID_PATH.read_text().strip())
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
-        print("Daemon not running")
+        print("Not running")
         return
-    print("✓ Daemon stopped")
-
-
-def daemon_status() -> None:
-    if _daemon_running():
-        print("Daemon Status: Running")
-        response = _daemon_request("STATUS")
-        if response:
-            try:
-                payload = json.loads(response)
-                perms = payload.get("permissions", {})
-                print("Permissions:")
-                print(f"  Accessibility: {format_perm(perms.get('accessibility'))}")
-                print(f"  Automation:    {format_perm(perms.get('automation'))}")
-                print(f"  Screen Recording: {format_perm(perms.get('screen_recording'))}")
-            except json.JSONDecodeError:
-                pass
-    else:
-        print("Daemon Status: Not running")
+    print("✓ Stopped")
 
 
 def daemon_install() -> None:
@@ -690,12 +710,6 @@ def db_prune() -> None:
 def db_backup() -> None:
     path = backup_database(DB_PATH)
     print(f"✓ Backup created: {path}")
-
-
-def format_perm(value: Optional[bool]) -> str:
-    if value is None:
-        return "? Unknown"
-    return "✓ Granted" if value else "✗ Not granted"
 
 
 def _fetch_sessions(start_utc: Optional[datetime], end_utc: Optional[datetime]):
@@ -769,6 +783,58 @@ def _activity_totals(start_utc: datetime, end_utc: datetime, poll_interval: int)
             active_count = row["count"]
 
     return active_count * poll_interval, idle_count * poll_interval
+
+
+def _activity_by_day(
+    start_utc: datetime, end_utc: datetime, poll_interval: int
+) -> dict:
+    """Aggregate activity by day of week. Returns {0: seconds, 1: seconds, ...} for Mon-Sun."""
+    start_str, end_str = utc_range_to_strings(start_utc, end_utc)
+    with get_db_connection(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT timestamp, idle FROM activities "
+            "WHERE timestamp >= ? AND timestamp <= ?",
+            (start_str, end_str),
+        ).fetchall()
+
+    by_day: dict = {i: 0 for i in range(7)}  # 0=Mon, 6=Sun
+    for row in rows:
+        if row["idle"]:
+            continue
+        ts = parse_utc_timestamp(row["timestamp"])
+        local_ts = ts.astimezone()
+        weekday = local_ts.weekday()
+        by_day[weekday] += poll_interval
+
+    return by_day
+
+
+def _activity_by_app(
+    start_utc: datetime, end_utc: datetime, poll_interval: int, limit: int = 5
+) -> List[Tuple[str, int]]:
+    """Aggregate activity by app. Returns [(app_name, seconds), ...] sorted by time desc."""
+    start_str, end_str = utc_range_to_strings(start_utc, end_utc)
+    with get_db_connection(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT app_name, COUNT(*) as count FROM activities "
+            "WHERE timestamp >= ? AND timestamp <= ? AND idle = 0 AND app_name IS NOT NULL "
+            "GROUP BY app_name ORDER BY count DESC",
+            (start_str, end_str),
+        ).fetchall()
+
+    result = []
+    other_seconds = 0
+    for i, row in enumerate(rows):
+        seconds = row["count"] * poll_interval
+        if i < limit:
+            result.append((row["app_name"], seconds))
+        else:
+            other_seconds += seconds
+
+    if other_seconds > 0:
+        result.append(("Other", other_seconds))
+
+    return result
 
 
 def _project_name(project_id: int) -> str:
@@ -862,21 +928,14 @@ def build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--output", required=True)
     export_parser.add_argument("--table", choices=["sessions", "activities"], default="sessions")
 
-    # tracking
-    tracking_parser = subparsers.add_parser("tracking", help="Pause/resume tracking")
-    tracking_sub = tracking_parser.add_subparsers(dest="subcommand")
-    tracking_sub.add_parser("pause")
-    tracking_sub.add_parser("resume")
-    tracking_sub.add_parser("status")
+    # start/stop
+    start_parser = subparsers.add_parser("start", help="Start tracking")
+    start_parser.add_argument("--install", action="store_true", help="Install as LaunchAgent")
 
-    # daemon
-    daemon_parser = subparsers.add_parser("daemon", help="Manage daemon")
-    daemon_sub = daemon_parser.add_subparsers(dest="subcommand")
-    daemon_start_parser = daemon_sub.add_parser("start")
-    daemon_start_parser.add_argument("--foreground", action="store_true")
-    daemon_sub.add_parser("stop")
-    daemon_sub.add_parser("status")
-    daemon_sub.add_parser("install")
+    subparsers.add_parser("stop", help="Stop tracking")
+
+    # help
+    subparsers.add_parser("help", help="Show help")
 
     # config
     config_parser = subparsers.add_parser("config", help="View or set configuration")
@@ -904,7 +963,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command is None:
-        parser.print_help()
+        show_help()
         return 0
 
     init_database(DB_PATH)
@@ -957,28 +1016,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             activity_show(args.limit, args.date_str, args.from_date, args.to_date)
         elif args.command == "export":
             export_data(args.output, args.format, args.from_date, args.to_date, args.table)
-        elif args.command == "tracking":
-            sub = args.subcommand or "status"
-            if sub == "pause":
-                tracking_pause()
-            elif sub == "resume":
-                tracking_resume()
-            elif sub == "status":
-                tracking_status()
-            else:
-                raise CliError("Unknown tracking subcommand")
-        elif args.command == "daemon":
-            sub = args.subcommand or "status"
-            if sub == "start":
-                daemon_start(args.foreground)
-            elif sub == "stop":
-                daemon_stop()
-            elif sub == "status":
-                daemon_status()
-            elif sub == "install":
-                daemon_install()
-            else:
-                raise CliError("Unknown daemon subcommand")
+        elif args.command == "start":
+            start_tracking(args.install)
+        elif args.command == "stop":
+            stop_tracking()
+        elif args.command == "help":
+            show_help()
         elif args.command == "config":
             sub = args.subcommand or "list"
             if sub == "list":
